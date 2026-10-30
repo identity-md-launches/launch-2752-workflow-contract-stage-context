@@ -26,6 +26,9 @@ contract RoadTripVotesHandler is Test {
     mapping(uint256 epoch => bool) public ghostFinalized;
 
     uint256[] public ghostRouteEpochs;
+    /// @dev Epochs in the order they received their first vote, and the index of the oldest unfinalized one.
+    uint256[] public ghostVotedEpochs;
+    uint256 public ghostCursor;
     uint256[] public ghostRouteIds;
 
     /// @dev Counts every call whose outcome disagreed with the model. Must stay zero.
@@ -73,6 +76,7 @@ contract RoadTripVotesHandler is Test {
         try votes.vote(id) {
             calls_vote++;
             if (expectedError.length != 0) mismatches++;
+            if (ghostTotal[epoch] == 0) ghostVotedEpochs.push(epoch);
             ghostVoted[epoch][actor] = true;
             ghostChoice[epoch][actor] = id;
             ghostVotes[epoch][id] += 1;
@@ -101,12 +105,13 @@ contract RoadTripVotesHandler is Test {
         }
     }
 
-    /// @notice Anyone finalizes a touched epoch, the current one, or a future one.
+    /// @notice Anyone finalizes the pending epoch, a touched epoch, the current one, or a future one.
     function finalize(uint256 epochSeed, address caller) external {
         uint256 current = votes.currentEpoch();
         uint256 epoch;
         uint256 mode = epochSeed % 4;
         if (mode == 0 || touchedEpochs.length == 0) epoch = current + ((epochSeed >> 8) % 3); // not ended
+        else if (mode == 1 && ghostCursor < ghostVotedEpochs.length) epoch = ghostVotedEpochs[ghostCursor];
         else epoch = touchedEpochs[(epochSeed >> 8) % touchedEpochs.length];
         _touch(epoch);
 
@@ -117,6 +122,10 @@ contract RoadTripVotesHandler is Test {
             expectedError = abi.encodeWithSelector(RoadTripVotes.AlreadyFinalized.selector, epoch);
         } else if (ghostTotal[epoch] == 0) {
             expectedError = abi.encodeWithSelector(RoadTripVotes.NoVotes.selector, epoch);
+        } else if (ghostVotedEpochs[ghostCursor] != epoch) {
+            // An ended, unfinalized epoch with votes is always at or after the cursor, so the entry exists.
+            expectedError =
+                abi.encodeWithSelector(RoadTripVotes.NotNextInQueue.selector, epoch, ghostVotedEpochs[ghostCursor]);
         }
 
         vm.prank(caller);
@@ -124,6 +133,7 @@ contract RoadTripVotesHandler is Test {
             calls_finalize++;
             if (expectedError.length != 0) mismatches++;
             ghostFinalized[epoch] = true;
+            ghostCursor++;
             (uint256 expectedWinner,) = modelLeader(epoch);
             ghostRouteEpochs.push(epoch);
             ghostRouteIds.push(expectedWinner);
@@ -165,6 +175,10 @@ contract RoadTripVotesHandler is Test {
 
     function actorCount() external view returns (uint256) {
         return actors.length;
+    }
+
+    function votedEpochCount() external view returns (uint256) {
+        return ghostVotedEpochs.length;
     }
 
     function routeCount() external view returns (uint256) {
@@ -254,7 +268,7 @@ contract RoadTripVotesInvariantTest is Test {
         }
     }
 
-    /// @dev The route holds exactly one stop per finalized epoch, in finalization order, each with the epoch's
+    /// @dev The route holds exactly one stop per finalized epoch, in strictly increasing epoch order, each with the epoch's
     ///      winner; only ended epochs with votes are ever finalized; unfinalized epochs have no winner.
     /// forge-config: default.invariant.runs = 256
     /// forge-config: default.invariant.depth = 64
@@ -276,9 +290,7 @@ contract RoadTripVotesInvariantTest is Test {
             assertLt(stop.epoch, current, "finalized epoch has not ended");
             assertGt(votes.totalVotes(stop.epoch), 0, "finalized epoch without votes");
             assertLt(stop.destinationId, DESTINATION_COUNT, "winner out of range");
-            for (uint256 j; j < i; ++j) {
-                assertTrue(all[j].epoch != stop.epoch, "epoch appended to route twice");
-            }
+            if (i > 0) assertGt(stop.epoch, all[i - 1].epoch, "route not in strictly increasing epoch order");
         }
 
         uint256 n = handler.touchedCount();
@@ -296,6 +308,28 @@ contract RoadTripVotesInvariantTest is Test {
             }
         }
         assertEq(finalizedCount, len, "finalized epochs != route stops");
+    }
+
+    /// @dev The finalization queue: every epoch with votes is enrolled once in increasing order, everything before
+    ///      the pending epoch is finalized and everything from it on is not, so the route is exactly the voted
+    ///      epochs' prefix and no ended epoch with votes is ever skipped.
+    /// forge-config: default.invariant.runs = 256
+    /// forge-config: default.invariant.depth = 64
+    function invariant_pendingEpochIsOldestUnfinalized() public view {
+        uint256 n = handler.votedEpochCount();
+        assertEq(votes.votedEpochCount(), n, "votedEpochCount");
+        uint256 cursor = handler.ghostCursor();
+        assertEq(votes.routeLength(), cursor, "route length != finalized prefix");
+        (bool exists, uint256 pending) = votes.pendingEpoch();
+        assertEq(exists, cursor < n, "pendingEpoch.exists");
+        assertEq(pending, cursor < n ? handler.ghostVotedEpochs(cursor) : 0, "pendingEpoch.epoch");
+        for (uint256 i; i < n; ++i) {
+            uint256 epoch = handler.ghostVotedEpochs(i);
+            if (i > 0) assertGt(epoch, handler.ghostVotedEpochs(i - 1), "voted epochs not increasing");
+            assertGt(votes.totalVotes(epoch), 0, "enrolled epoch without votes");
+            assertEq(votes.isFinalized(epoch), i < cursor, "finalized set is not a prefix of the queue");
+            if (i < cursor) assertEq(votes.routeAt(i).epoch, epoch, "route stop is not the queue entry");
+        }
     }
 
     /// @dev The game holds no value: nothing the handler does can leave ETH in the contract.

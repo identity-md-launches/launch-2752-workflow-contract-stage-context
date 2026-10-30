@@ -325,12 +325,54 @@ contract RoadTripVotesEdgeTest is Test {
         _vote(votes, bob, 3);
         vm.warp(votes.epochEnd(e0 + 1));
 
-        vm.expectEmit(true, true, true, true, address(votes));
-        emit Finalized(e0 + 1, 2, 1, 2, 0);
+        // The newer epoch cannot jump the queue; the failed attempt consumes no route index.
+        vm.expectRevert(abi.encodeWithSelector(RoadTripVotes.NotNextInQueue.selector, e0 + 1, e0));
         votes.finalize(e0 + 1);
+
         vm.expectEmit(true, true, true, true, address(votes));
-        emit Finalized(e0, 1, 1, 1, 1);
+        emit Finalized(e0, 1, 1, 1, 0);
         votes.finalize(e0);
+        vm.expectEmit(true, true, true, true, address(votes));
+        emit Finalized(e0 + 1, 2, 1, 2, 1);
+        votes.finalize(e0 + 1);
+
+        (bool exists,) = votes.pendingEpoch();
+        assertFalse(exists);
+    }
+
+    function test_pendingEpoch_skipsEmptyEpochsAndStaysOnCurrent() public {
+        uint256 e0 = votes.currentEpoch();
+        (bool exists, uint256 pending) = votes.pendingEpoch();
+        assertFalse(exists);
+        assertEq(pending, 0);
+
+        _vote(votes, alice, 4);
+        // Ten empty epochs pass; the voted one is still the only pending epoch.
+        vm.warp(votes.epochEnd(e0 + 10));
+        _vote(votes, bob, 5);
+        (exists, pending) = votes.pendingEpoch();
+        assertTrue(exists);
+        assertEq(pending, e0);
+        assertEq(votes.votedEpochCount(), 2);
+
+        // Empty epochs in between are rejected as NoVotes, not as out of queue.
+        vm.expectRevert(abi.encodeWithSelector(RoadTripVotes.NoVotes.selector, e0 + 5));
+        votes.finalize(e0 + 5);
+
+        votes.finalize(e0);
+        (exists, pending) = votes.pendingEpoch();
+        assertTrue(exists);
+        assertEq(pending, e0 + 11);
+        // The pending epoch is the open one: it waits for its end and the cursor does not move.
+        vm.expectRevert(abi.encodeWithSelector(RoadTripVotes.EpochNotEnded.selector, e0 + 11, e0 + 11));
+        votes.finalize(e0 + 11);
+        (exists, pending) = votes.pendingEpoch();
+        assertEq(pending, e0 + 11);
+
+        vm.warp(votes.epochEnd(e0 + 11));
+        votes.finalize(e0 + 11);
+        assertEq(votes.routeLength(), 2);
+        assertEq(votes.routeAt(1).destinationId, 5);
     }
 
     function test_finalize_fromContractCaller() public {
