@@ -382,7 +382,7 @@ contract RoadTripVotesTest is Test {
         assertEq(votes.winnerOf(epoch), 2);
     }
 
-    function test_finalize_outOfOrderBuildsRouteInFinalizationOrder() public {
+    function test_finalize_severalWaitingEpochsJoinRouteInEpochOrder() public {
         uint256 e0 = votes.currentEpoch();
         _vote(alice, 10);
         _nextEpoch();
@@ -391,17 +391,18 @@ contract RoadTripVotesTest is Test {
         _vote(alice, 30);
         _nextEpoch();
 
-        votes.finalize(e0 + 2);
+        // Three ended days are waiting. Only the oldest is accepted at each step.
         votes.finalize(e0);
         votes.finalize(e0 + 1);
+        votes.finalize(e0 + 2);
 
         assertEq(votes.routeLength(), 3);
-        assertEq(votes.routeAt(0).destinationId, 30);
-        assertEq(votes.routeAt(1).destinationId, 10);
-        assertEq(votes.routeAt(2).destinationId, 20);
-        assertEq(votes.routeAt(0).epoch, e0 + 2);
-        assertEq(votes.routeAt(1).epoch, e0);
-        assertEq(votes.routeAt(2).epoch, e0 + 1);
+        assertEq(votes.routeAt(0).epoch, e0);
+        assertEq(votes.routeAt(0).destinationId, 10);
+        assertEq(votes.routeAt(1).epoch, e0 + 1);
+        assertEq(votes.routeAt(1).destinationId, 20);
+        assertEq(votes.routeAt(2).epoch, e0 + 2);
+        assertEq(votes.routeAt(2).destinationId, 30);
     }
 
     function test_finalize_emptyEpochsCanBeSkipped() public {
@@ -413,6 +414,10 @@ contract RoadTripVotesTest is Test {
         _nextEpoch();
 
         votes.finalize(e0);
+        // The empty day is not in the queue: it can never be finalized and does not block the next one.
+        (bool exists, uint256 pending) = votes.pendingEpoch();
+        assertTrue(exists);
+        assertEq(pending, e0 + 2);
         vm.expectRevert(abi.encodeWithSelector(RoadTripVotes.NoVotes.selector, e0 + 1));
         votes.finalize(e0 + 1);
         votes.finalize(e0 + 2);
@@ -420,6 +425,43 @@ contract RoadTripVotesTest is Test {
         assertEq(votes.routeLength(), 2);
         assertEq(votes.routeAt(1).destinationId, 20);
         assertFalse(votes.isFinalized(e0 + 1));
+        assertEq(votes.votedEpochCount(), 2);
+    }
+
+    function test_pendingEpoch_followsVotesAndFinalizations() public {
+        uint256 e0 = votes.currentEpoch();
+        (bool exists, uint256 pending) = votes.pendingEpoch();
+        assertFalse(exists, "nothing waiting before any vote");
+        assertEq(pending, 0);
+        assertEq(votes.votedEpochCount(), 0);
+
+        _vote(alice, 1);
+        (exists, pending) = votes.pendingEpoch();
+        assertTrue(exists, "the current epoch is pending as soon as it has a vote");
+        assertEq(pending, e0);
+        _vote(bob, 2);
+        assertEq(votes.votedEpochCount(), 1, "a second vote in the same epoch does not enrol it twice");
+
+        _nextEpoch();
+        votes.finalize(e0);
+        (exists, pending) = votes.pendingEpoch();
+        assertFalse(exists, "queue drained");
+
+        _vote(carol, 3);
+        (exists, pending) = votes.pendingEpoch();
+        assertTrue(exists);
+        assertEq(pending, e0 + 1);
+        assertEq(votes.votedEpochCount(), 2);
+    }
+
+    function test_finalize_pendingCurrentEpochStillRevertsNotEnded() public {
+        uint256 e0 = votes.currentEpoch();
+        _vote(alice, 1);
+        (bool exists, uint256 pending) = votes.pendingEpoch();
+        assertTrue(exists);
+        assertEq(pending, e0);
+        vm.expectRevert(abi.encodeWithSelector(RoadTripVotes.EpochNotEnded.selector, e0, e0));
+        votes.finalize(e0);
     }
 
     function test_finalize_laterVotesDoNotChangeRecordedWinner() public {
@@ -483,6 +525,148 @@ contract RoadTripVotesTest is Test {
         epoch = bound(epoch, current, type(uint256).max);
         vm.expectRevert(abi.encodeWithSelector(RoadTripVotes.EpochNotEnded.selector, epoch, current));
         votes.finalize(epoch);
+    }
+
+    function test_finalize_revertsWhenOlderVotedEpochIsPending() public {
+        uint256 e0 = votes.currentEpoch();
+        _vote(alice, 10);
+        _nextEpoch();
+        _vote(bob, 20);
+        _nextEpoch();
+        _vote(carol, 30);
+        _nextEpoch();
+
+        vm.expectRevert(abi.encodeWithSelector(RoadTripVotes.NotNextInQueue.selector, e0 + 2, e0));
+        votes.finalize(e0 + 2);
+        vm.expectRevert(abi.encodeWithSelector(RoadTripVotes.NotNextInQueue.selector, e0 + 1, e0));
+        votes.finalize(e0 + 1);
+        assertEq(votes.routeLength(), 0, "nothing appended by refused calls");
+        assertFalse(votes.isFinalized(e0 + 1));
+        assertFalse(votes.isFinalized(e0 + 2));
+
+        votes.finalize(e0);
+        vm.expectRevert(abi.encodeWithSelector(RoadTripVotes.NotNextInQueue.selector, e0 + 2, e0 + 1));
+        votes.finalize(e0 + 2);
+        votes.finalize(e0 + 1);
+        votes.finalize(e0 + 2);
+        assertEq(votes.routeLength(), 3);
+        assertEq(votes.routeAt(2).destinationId, 30);
+    }
+
+    function test_finalize_strangerCannotReorderRoute() public {
+        // The reviewer's scenario: two ended days waiting, a wallet that never voted finalizes the later
+        // one first. The call is refused and the route still starts with the day that ended first.
+        uint256 e0 = votes.currentEpoch();
+        _vote(alice, 10);
+        _nextEpoch();
+        _vote(bob, 20);
+        _nextEpoch();
+
+        address stranger = makeAddr("stranger");
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(RoadTripVotes.NotNextInQueue.selector, e0 + 1, e0));
+        votes.finalize(e0 + 1);
+
+        vm.prank(stranger);
+        votes.finalize(e0);
+        vm.prank(stranger);
+        votes.finalize(e0 + 1);
+
+        assertEq(votes.routeAt(0).epoch, e0);
+        assertEq(votes.routeAt(0).destinationId, 10);
+        assertEq(votes.routeAt(1).epoch, e0 + 1);
+        assertEq(votes.routeAt(1).destinationId, 20);
+    }
+
+    function test_finalize_staleEpochCannotBeAppendedAfterNewerOnes() public {
+        // An old day held back for a year still has to go first: newer days stay blocked until it is
+        // finalized, so its winner can never land after theirs.
+        uint256 e0 = votes.currentEpoch();
+        _vote(alice, 10);
+        vm.warp(START + 365 * EPOCH_SECONDS);
+        uint256 later = votes.currentEpoch();
+        _vote(bob, 20);
+        _nextEpoch();
+
+        vm.expectRevert(abi.encodeWithSelector(RoadTripVotes.NotNextInQueue.selector, later, e0));
+        votes.finalize(later);
+        votes.finalize(e0);
+        votes.finalize(later);
+
+        assertEq(votes.routeAt(0).epoch, e0);
+        assertEq(votes.routeAt(0).destinationId, 10);
+        assertEq(votes.routeAt(1).epoch, later);
+        assertEq(votes.routeAt(1).destinationId, 20);
+    }
+
+    function test_finalize_orderCheckDoesNotMaskOtherErrors() public {
+        uint256 e0 = votes.currentEpoch();
+        _vote(alice, 10);
+        _nextEpoch();
+        _nextEpoch();
+        _vote(bob, 20);
+        _nextEpoch();
+
+        // Empty day: NoVotes, not NotNextInQueue.
+        vm.expectRevert(abi.encodeWithSelector(RoadTripVotes.NoVotes.selector, e0 + 1));
+        votes.finalize(e0 + 1);
+        // Future day: EpochNotEnded, not NotNextInQueue.
+        vm.expectRevert(abi.encodeWithSelector(RoadTripVotes.EpochNotEnded.selector, e0 + 3, e0 + 3));
+        votes.finalize(e0 + 3);
+        votes.finalize(e0);
+        // Already finalized: AlreadyFinalized, not NotNextInQueue.
+        vm.expectRevert(abi.encodeWithSelector(RoadTripVotes.AlreadyFinalized.selector, e0));
+        votes.finalize(e0);
+        votes.finalize(e0 + 2);
+    }
+
+    /// @dev Over a random pattern of voted and empty days, finalizing anything but the oldest voted day
+    ///      is refused, finalizing in order always succeeds, and the route ends up in epoch order with one
+    ///      stop per voted day.
+    function testFuzz_finalize_routeIsAlwaysInEpochOrder(uint16 votedMask, uint8 dayCount) public {
+        dayCount = uint8(bound(dayCount, 1, 16));
+        uint256 e0 = votes.currentEpoch();
+        uint256 votedDays;
+        for (uint256 d; d < dayCount; ++d) {
+            if ((votedMask >> d) & 1 == 1) {
+                address voter = address(uint160(0x2000 + d));
+                _vote(voter, d % DESTINATION_COUNT);
+                ++votedDays;
+            }
+            _nextEpoch();
+        }
+        assertEq(votes.votedEpochCount(), votedDays);
+
+        uint256 expectedIndex;
+        for (uint256 d; d < dayCount; ++d) {
+            if ((votedMask >> d) & 1 == 0) {
+                vm.expectRevert(abi.encodeWithSelector(RoadTripVotes.NoVotes.selector, e0 + d));
+                votes.finalize(e0 + d);
+                continue;
+            }
+            (bool exists, uint256 pending) = votes.pendingEpoch();
+            assertTrue(exists);
+            assertEq(pending, e0 + d, "oldest unfinalized voted day is pending");
+            // Any later voted day is refused while this one waits.
+            for (uint256 later = d + 1; later < dayCount; ++later) {
+                if ((votedMask >> later) & 1 == 1) {
+                    vm.expectRevert(abi.encodeWithSelector(RoadTripVotes.NotNextInQueue.selector, e0 + later, e0 + d));
+                    votes.finalize(e0 + later);
+                    break;
+                }
+            }
+            votes.finalize(e0 + d);
+            RoadTripVotes.RouteStop memory stop = votes.routeAt(expectedIndex);
+            assertEq(stop.epoch, e0 + d);
+            assertEq(stop.destinationId, d % DESTINATION_COUNT);
+            ++expectedIndex;
+        }
+        assertEq(votes.routeLength(), votedDays);
+        (bool left,) = votes.pendingEpoch();
+        assertFalse(left, "queue drained");
+        for (uint256 i = 1; i < votedDays; ++i) {
+            assertLt(votes.routeAt(i - 1).epoch, votes.routeAt(i).epoch, "strictly increasing epochs");
+        }
     }
 
     // ---------------------------------------------------------------------------------------------

@@ -5,7 +5,9 @@ pragma solidity 0.8.26;
 /// @notice Community voting for the Hamster Road Trip game. Time is split into fixed-length epochs.
 ///         During an epoch every wallet may cast exactly one vote for one destination id. Once an epoch
 ///         has ended, anyone may finalize it: the destination with the most votes wins, ties go to the
-///         lowest id, and the winner is appended to the route queue exactly once.
+///         lowest id, and the winner is appended to the route queue exactly once. Epochs that received
+///         votes must be finalized in the order they ended, so the route queue is in epoch order no
+///         matter who calls `finalize` or when.
 /// @dev    The contract has no owner, admin, upgrade path, token or payments. Everything it needs is
 ///         fixed at construction. Epochs are absolute: `epoch = block.timestamp / epochSeconds`, so with
 ///         the default 86 400 seconds an epoch is one UTC calendar day and epoch boundaries are 00:00 UTC.
@@ -54,6 +56,8 @@ contract RoadTripVotes {
     error AlreadyFinalized(uint256 epoch);
     /// @notice The epoch received no votes, so there is nothing to add to the route.
     error NoVotes(uint256 epoch);
+    /// @notice An older epoch with votes is still waiting; finalize `pendingEpoch` first.
+    error NotNextInQueue(uint256 epoch, uint256 pendingEpoch);
     /// @notice The epoch has no recorded winner (yet).
     error NotFinalized(uint256 epoch);
     /// @notice The route index is beyond the end of the queue.
@@ -94,8 +98,15 @@ contract RoadTripVotes {
     /// @dev epoch => running tally and finalization state
     mapping(uint256 epoch => Tally tally) private _tallies;
 
-    /// @dev Winners in finalization order.
+    /// @dev Winners in epoch order (finalization is forced to follow it).
     RouteStop[] private _route;
+
+    /// @dev Every epoch that received at least one vote, in the order the votes arrived. Votes are only
+    ///      accepted for the current epoch, so this is strictly increasing.
+    uint256[] private _votedEpochs;
+
+    /// @dev Index into `_votedEpochs` of the oldest epoch that is not finalized yet.
+    uint256 private _finalizeCursor;
 
     // ---------------------------------------------------------------------------------------------
     // Constructor
@@ -130,6 +141,9 @@ contract RoadTripVotes {
         _votes[epoch][destinationId] = votes;
 
         Tally storage tally = _tallies[epoch];
+        // The first vote of an epoch enrols it in the finalization queue, so winners join the route in
+        // epoch order and empty epochs never block it.
+        if (tally.totalVotes == 0) _votedEpochs.push(epoch);
         tally.totalVotes += 1;
         // Keep `leader` equal to the destination with the most votes, lowest id among ties.
         if (votes > tally.leaderVotes || (votes == tally.leaderVotes && destinationId < tally.leader)) {
@@ -141,8 +155,11 @@ contract RoadTripVotes {
     }
 
     /// @notice Record the winner of an ended epoch and append it to the route queue. Anyone may call.
-    /// @dev    Reverts if the epoch has not ended, was already finalized, or received no votes. Epochs
-    ///         may be finalized in any order; the route queue is in finalization order.
+    /// @dev    Reverts if the epoch has not ended, was already finalized, received no votes, or is not
+    ///         the oldest unfinalized epoch with votes (`NotNextInQueue`). Epochs with votes are thus
+    ///         finalized strictly in epoch order, so the route queue is in epoch order whoever calls;
+    ///         epochs without votes are not in the queue and never block it. Use `pendingEpoch()` to
+    ///         find the epoch that must be finalized next.
     /// @param epoch Epoch to finalize.
     function finalize(uint256 epoch) external {
         uint256 current = currentEpoch();
@@ -151,6 +168,13 @@ contract RoadTripVotes {
         Tally storage tally = _tallies[epoch];
         if (tally.finalized) revert AlreadyFinalized(epoch);
         if (tally.totalVotes == 0) revert NoVotes(epoch);
+
+        // An ended, unfinalized epoch with votes is always in `_votedEpochs` at or after the cursor, so
+        // the cursor's entry exists and is at most `epoch`.
+        uint256 cursor = _finalizeCursor;
+        uint256 pending = _votedEpochs[cursor];
+        if (pending != epoch) revert NotNextInQueue(epoch, pending);
+        _finalizeCursor = cursor + 1;
 
         tally.finalized = true;
         uint256 winner = tally.leader;
@@ -230,18 +254,34 @@ contract RoadTripVotes {
         return tally.leader;
     }
 
+    /// @notice The oldest epoch with votes that is not finalized yet: the only epoch `finalize` accepts.
+    /// @dev    It may be the current epoch, in which case `finalize` reverts with `EpochNotEnded` until
+    ///         it ends. Does not revert when nothing is waiting.
+    /// @return exists Whether any epoch with votes is still unfinalized.
+    /// @return epoch The pending epoch (0 when `exists` is false).
+    function pendingEpoch() external view returns (bool exists, uint256 epoch) {
+        uint256 cursor = _finalizeCursor;
+        if (cursor >= _votedEpochs.length) return (false, 0);
+        return (true, _votedEpochs[cursor]);
+    }
+
+    /// @notice Number of epochs that received at least one vote (finalized or not).
+    function votedEpochCount() external view returns (uint256) {
+        return _votedEpochs.length;
+    }
+
     /// @notice Number of stops in the route queue (one per finalized epoch).
     function routeLength() external view returns (uint256) {
         return _route.length;
     }
 
-    /// @notice The route stop at `index`, in finalization order.
+    /// @notice The route stop at `index`, in epoch order.
     function routeAt(uint256 index) external view returns (RouteStop memory) {
         if (index >= _route.length) revert RouteIndexOutOfRange(index, _route.length);
         return _route[index];
     }
 
-    /// @notice The whole route queue, in finalization order.
+    /// @notice The whole route queue, in epoch order.
     function route() external view returns (RouteStop[] memory) {
         return _route;
     }

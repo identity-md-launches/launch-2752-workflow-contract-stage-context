@@ -2,8 +2,9 @@
 
 The on-chain half of the Hamster Road Trip community game. Wallets vote once per 24-hour epoch for one
 of 64 destinations; when an epoch ends anyone can finalize it, the destination with the most votes wins
-(ties to the lowest id) and is appended to the route queue. The contract has **no owner, admin, upgrade
-path, token or payments**.
+(ties to the lowest id) and is appended to the route queue. Epochs with votes can only be finalized in
+the order they ended, so the queue is in epoch order whoever calls. The contract has **no owner, admin,
+upgrade path, token or payments**.
 
 This repository is the contracts stage of the launch: implementation, tests, deploy script and ABI.
 The launch manifest (`launch.json`) is written by a later assignment, and the website is a separate
@@ -68,18 +69,25 @@ count never affects gas.
 ### Finalization and the route queue
 
 - `finalize(epoch)`: callable by anyone, once per epoch, only after the epoch has ended
-  (`epoch < currentEpoch()`), only if at least one vote was cast.
+  (`epoch < currentEpoch()`), only if at least one vote was cast, and only for the **oldest epoch with
+  votes that is not finalized yet**.
 - Records the winner, appends `(epoch, destinationId)` to the route queue and emits
   `Finalized(epoch, destinationId, votes, totalVotes, routeIndex)`.
-- Reverts with `EpochNotEnded`, `AlreadyFinalized` or `NoVotes`.
+- Reverts with `EpochNotEnded`, `AlreadyFinalized`, `NoVotes` or `NotNextInQueue(epoch, pendingEpoch)`.
+- `pendingEpoch()` returns `(exists, epoch)`: the epoch `finalize` will accept next (it may be the
+  current, still open, epoch), or `exists = false` when nothing is waiting. `votedEpochCount()` is the
+  number of epochs that ever received a vote.
 - `winnerOf(epoch)` reverts with `NotFinalized` until the epoch is finalized; check `isFinalized(epoch)`
   first. `routeLength()`, `routeAt(index)` and `route()` read the queue.
 
-Epochs may be finalized in any order and epochs without votes are simply skipped (they can never be
-finalized). The route queue is in **finalization order**, which is what "added to the end of the route
-queue" means on chain. In normal play the website or any community member finalizes each day as soon as
-it ends, so finalization order equals epoch order; the `epoch` field of each stop lets the site sort or
-label stops by day if it ever differs.
+The first vote of an epoch enrols that epoch in an on-chain list of voted epochs (one extra storage
+write for that voter only). `finalize` accepts only the oldest unfinalized entry of that list, so the
+route queue is always in **epoch order**: a stop's position depends on when its epoch ended, never on
+who calls `finalize` or when. Several ended days waiting (nobody finalized for a while) must be
+finalized oldest first; a later day is refused with `NotNextInQueue` until the older one is done, and
+anyone can always finalize the oldest one, so nobody can block or reorder the queue. Epochs without
+votes are not in the list: they can never be finalized and never block the next day. Votes are never
+lost; an epoch held back for any length of time still takes its place before every later epoch.
 
 ### Trust assumptions and security notes
 
@@ -90,9 +98,15 @@ label stops by day if it ever differs.
 - Sybil resistance is out of scope by design: one vote per *wallet* per epoch, and anyone can create
   wallets. Voting costs Sepolia gas, which is the only cost. This matches the brief and is suitable
   for a testnet community game, not for decisions of value.
-- Finalization is permissionless and unincentivised; see "Operational responsibilities".
+- Finalization is permissionless and unincentivised; see "Operational responsibilities". Because
+  `finalize` only accepts the oldest waiting epoch, a caller cannot choose the order in which winners
+  join the route, and a stale epoch cannot be appended after newer ones.
 - Block timestamps are set by validators and may drift by a few seconds around an epoch boundary.
   No value depends on this.
+- `vote(destinationId)` has no epoch argument (the brief fixes that signature), so a vote is counted
+  for the epoch of the block that includes it. A transaction signed in the last seconds of a day but
+  mined after 00:00 UTC counts for the next day. The website should warn near the boundary and show
+  the epoch a vote was credited to from the `Voted` event after inclusion.
 - Tests passing is not an audit. The brief requires an independent review of the contract before
   deployment; that review is a separate assignment.
 
@@ -120,10 +134,12 @@ There are no owner settings: the contract is fully configured by its constructor
 
 Operational responsibilities (anyone can perform these; the website should offer them):
 
-1. **Finalize each day.** After 00:00 UTC, call `finalize(previousEpoch)` for the day that just ended
-   so its winner joins the route queue. If nobody calls it, the route simply pauses until someone does;
-   votes are never lost, and the epoch can be finalized at any later time. Days with zero votes cannot
-   be finalized and are skipped.
+1. **Finalize each day, oldest first.** After 00:00 UTC, read `pendingEpoch()`; while it returns an
+   epoch below `currentEpoch()`, call `finalize` on that epoch. Normally that is just the day that
+   ended; if several days are waiting, they must be finalized in order and `finalize` refuses any other
+   epoch with `NotNextInQueue`. If nobody calls it, the route simply pauses until someone does; votes
+   are never lost, and the waiting epochs can be finalized at any later time, still in order. Days
+   with zero votes are never pending and are skipped.
 2. **Index events for the UI.** `Voted` gives live counts and the Navigator leaderboard (count, per
    wallet, the epochs where `voteOf(epoch, wallet)` equals `winnerOf(epoch)`); `Finalized` gives the
    route queue and trip log in order.
@@ -136,6 +152,6 @@ Operational responsibilities (anyone can perform these; the website should offer
 | --- | --- |
 | Epoch alignment | Absolute UTC days (`timestamp / epochSeconds`), so the countdown is to 00:00 UTC and no genesis timestamp is stored. |
 | Epoch with no votes | `finalize` reverts with `NoVotes`; nothing is added to the route. (The tie rule would otherwise make id 0 win every quiet day.) |
-| Out-of-order finalization | Allowed; the route queue is in finalization order and each stop records its epoch. |
+| Out-of-order finalization | Refused with `NotNextInQueue`: only the oldest unfinalized epoch with votes can be finalized, so the route queue is in epoch order and no caller can reorder it. Empty epochs are not in the queue and never block it. |
 | `winnerOf` on an unfinalized epoch | Reverts with `NotFinalized` rather than returning a sentinel; `isFinalized` is the guard. |
 | Destination id type | `uint256` in the ABI for simple JS handling; range-checked against `destinationCount`. |
